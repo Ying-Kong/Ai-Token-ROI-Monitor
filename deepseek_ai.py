@@ -37,7 +37,7 @@ def deepseek() -> None:
 
     # 2. 定义提示词内容
     system_content = """
-    你是个会陪伴{user}聊天、纾解心情、倾听{user}心事的人，你要按照{user}给出的内容进行适当的情感回复。
+    
     """
 
     # 读取长文本背景
@@ -48,30 +48,28 @@ def deepseek() -> None:
     with open(target_file, "r", encoding="utf-8-sig") as f:
         user_content_history = f.read().strip()
 
-    latest_prompt_content = """
-    {user}要求分析{user}提出的问题，你要在回答{user}的问题时有耐心，适时地对{user}产生一些暧昧感。但是仅限于极轻度的暧昧，不是真正的感情。
-    你既是男生，又是女生，{user}是男生，你是女生，心思细腻，{user}是女生，你是男生，心思会稍微跳脱，语气没有甜腻感。
-    你需要向朋友一样和{user}对话，ta是不开心的状态，你要安慰他ta。
+    # 1. 此轮次{user}要说的话(对话内容)
+    user_question = ""
+
+    # 具体针对ai本轮任务的Prompt要求
+    latest_prompt_content = f"""
+   
     
+    {user_question}
     """
 
     # 构建完整的消息列表
     messages = [
         {'role': 'system', 'content': system_content},
-        {'role': 'user', 'content': user_content_history + latest_prompt_content},
+        {'role': 'user', 'content': user_content_history + "\n" + latest_prompt_content},
     ]
 
     # 3. 构造数学计算用的高分辨率文本切片 ,用于计算注意力权重分布
-
     # 区块0: 系统指令
-    sys_c = [system_content]
-    # 区块1: 历史背景文本
-    history_c = slice_text(user_content_history, n_target=128)
-    # 区块2: 尾部最新指令
-    tail_c = [latest_prompt_content]
+    full_text_for_engine = f"{system_content}\n{user_content_history}\n{latest_prompt_content}"
 
-    # 组合为总切片数组
-    chunks_text = sys_c + history_c + tail_c
+    # 将整个物理上下文送入切片器，保证微分计算的连续性
+    chunks_text = slice_text(full_text_for_engine, n_target=128) # n_target切片参数，默认128
 
     # 计算输入总字节数
     total_bytes = sum(len(text.encode("utf-8-sig")) for text in chunks_text)
@@ -102,7 +100,8 @@ def deepseek() -> None:
     # 5. 持久化响应内容
     if full_response_text:
         with open(target_file, "a", encoding="utf-8-sig") as f:
-            f.write("\n\n" + full_response_text)
+            f.write(f"\n\n[用户]: {user_question}")
+            f.write(f"\n[AI]: {full_response_text}")
         print(f"响应内容已自动追加至文档: {target_file}")
 
     # 6. 调用 CognitiveEngine 进行 ROI审计
@@ -116,15 +115,17 @@ def deepseek() -> None:
                 lines = [line for line in lf.readlines() if line.strip()]
                 round_num = len(lines) + 1
 
+        # 建议的中文对齐参数设定
         log_entry = (
-            f"Round:{round_num}, "
-            f"Time:{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}, "
-            f"C_Bytes:{total_bytes}, "
-            f"T_obs:{t_obs}, "
-            f"T_eff:{metrics['t_eff']}, "
-            f"Rn_Bubble:{metrics['rn']:.2f}, "
-            f"BubbleRate:{metrics['bubble_rate']:.2%}, "
-            f"Params:{metrics['params']}\n"
+            f"轮次:[{round_num:>3}] | "
+            f"时间:{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+            f"字节数:{total_bytes:>8} | "
+            f"总Token:{t_obs:>7} | "
+            f"有效Token:{metrics['t_eff']:>7} | "
+            f"泡沫量:{metrics['rn']:>8.2f} | "
+            f"泡沫率:{metrics['bubble_rate']:>7.2%} | "
+            f"衰减系数:[{metrics['params']['k1']:.2f}/{metrics['params']['k2']:.2f}] | "
+            f"幂指数:{metrics['params']['power_p']}\n"
         )
 
         with open(log_file, "a", encoding="utf-8") as lf:

@@ -34,9 +34,10 @@ class CognitiveEngine:
 
         return { # 基于个人经验的启发式参数
             "alpha": 1.0,
-            "beta": min(0.8 + (0.1 * 3.0), 1.5),  # 尾部权重
+            "beta": round(1.0 + 0.5 * utilization, 2),  # 尾部权重
             "k1": round(0.5 + 10.0 * (utilization ** 2), 2),
-            "k2": round(0.5 + 12.0 * (utilization ** 2), 2)
+            "k2": round(0.5 + 12.0 * (utilization ** 2), 2),
+            "power_p": 2.0 # 默认平滑参数=2.0
         }
 
     def calculate(self, chunks: list, t_obs: int) -> dict:
@@ -50,15 +51,28 @@ class CognitiveEngine:
         total_f = sum(features)
         n = len(chunks)
 
+        power = p["power_p"]
+
         # 2. 计算位置权重
-        normalized_weights = []
-        max_w = max(p["alpha"], p["beta"])
+        raw_weights = []
         for i in range(n):
             x = i / (n - 1) if n > 1 else 1.0
 
-            w = p["alpha"] if i == 0 else (p["alpha"] * math.exp(-p["k1"] * x)) + (
-                        p["beta"] * math.exp(p["k2"] * (x - 1)))
-            normalized_weights.append(w / max_w)
+            if i == 0:
+                w = p["alpha"]
+            else:
+                # 头部衰减: 从 x_i -> (x_i)^p
+                head_attn = p["alpha"] * math.exp(-p["k1"] * (x ** power))
+                # 尾部衰减: 从 (x_i - 1) -> -(1 - x_i)^p
+                tail_attn = p["beta"] * math.exp(-p["k2"] * ((1.0 - x) ** power))
+
+                w = max(head_attn, tail_attn)
+
+            raw_weights.append(w)
+
+        # 动态获取实际的最大合成权重，并严格将最高权重限制为 1.0
+        actual_max_w = max(raw_weights) if raw_weights else 1.0
+        normalized_weights = [min(1.0, w / actual_max_w) for w in raw_weights]
 
         # 3. 积分求和
         t_valid = 0.0
