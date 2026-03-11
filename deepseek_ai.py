@@ -2,8 +2,8 @@ import datetime
 import yaml
 import os
 from openai import OpenAI
-# 从独立的 engine 模块导入引擎类和切片工具
-from engine import CognitiveEngine, slice_text
+# 从独立的 engine 模块导入计算引擎
+from engine import CognitiveEngine
 
 
 def get_config() -> dict:
@@ -13,7 +13,7 @@ def get_config() -> dict:
     return config
 
 
-def deepseek() -> None:
+def deepseek(user_question: str) -> None:
     # 1. 初始化配置与认知引擎
     config = get_config()
 
@@ -48,14 +48,13 @@ def deepseek() -> None:
     with open(target_file, "r", encoding="utf-8-sig") as f:
         user_content_history = f.read().strip()
 
-    # 1. 此轮次{user}要说的话(对话内容)
-    user_question = ""
+    # 1. {user_question}为此轮次{user}要说的话
 
-    # 具体针对ai本轮任务的Prompt要求
+    # 具体针对ai本轮任务的Prompt要求,{user_question}通过main.py的def deepseek()传参
     latest_prompt_content = f"""
-   
     
-    {user_question}
+    
+    {user_question}   
     """
 
     # 构建完整的消息列表
@@ -67,14 +66,10 @@ def deepseek() -> None:
     # 3. 构造数学计算用的高分辨率文本切片 ,用于计算注意力权重分布
     # 区块0: 系统指令
     full_text_for_engine = f"{system_content}\n{user_content_history}\n{latest_prompt_content}"
-
-    # 将整个物理上下文送入切片器，保证微分计算的连续性
-    chunks_text = slice_text(full_text_for_engine, n_target=128) # n_target切片参数，默认128
-
     # 计算输入总字节数
-    total_bytes = sum(len(text.encode("utf-8-sig")) for text in chunks_text)
+    total_bytes = len(full_text_for_engine.encode("utf-8-sig"))
 
-    # 4. 发起流式 API 请求
+    # 4. 发起流式API请求
     response = client.chat.completions.create(
         model='deepseek-chat',
         messages=messages,
@@ -105,7 +100,7 @@ def deepseek() -> None:
         print(f"响应内容已自动追加至文档: {target_file}")
 
     # 6. 调用 CognitiveEngine 进行 ROI审计
-    metrics = engine.calculate(chunks_text, t_obs)
+    metrics = engine.calculate(full_text_for_engine, t_obs)
 
     # 7. 写入日志
     if t_obs > 0:
@@ -115,18 +110,15 @@ def deepseek() -> None:
                 lines = [line for line in lf.readlines() if line.strip()]
                 round_num = len(lines) + 1
 
-        # 建议的中文对齐参数设定
-        log_entry = (
-            f"轮次:[{round_num:>3}] | "
-            f"时间:{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
-            f"字节数:{total_bytes:>8} | "
-            f"总Token:{t_obs:>7} | "
-            f"有效Token:{metrics['t_eff']:>7} | "
-            f"泡沫量:{metrics['rn']:>8.2f} | "
-            f"泡沫率:{metrics['bubble_rate']:>7.2%} | "
-            f"衰减系数:[{metrics['params']['k1']:.2f}/{metrics['params']['k2']:.2f}] | "
-            f"幂指数:{metrics['params']['power_p']}\n"
-        )
+                log_entry = (
+                    f"轮次:[{round_num:>3}] | "
+                    f"时间:{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+                    f"字节:{total_bytes:>6} | "
+                    f"Token:[总Token:{t_obs:>5} 有效Token:{metrics['t_eff']:>5}] | "
+                    f"总泡沫率:{metrics['bubble_rate']:>7.2%} |"
+                    f"架构底噪:{metrics['arch_bubble_rate']:>6.2%} | "
+                    f"衰减K值:[{metrics['params']['k1']:.3f}/{metrics['params']['k2']:.3f}]\n"
+                )
 
         with open(log_file, "a", encoding="utf-8") as lf:
             lf.write(log_entry)

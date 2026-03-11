@@ -1,92 +1,131 @@
 import math
-
-def slice_text(text: str, n_target: int = 128) -> list:
-    """动态分辨率切割文本"""
-    if not text: return []
-    total_len = len(text)
-    actual_n = max(1, min(n_target, max(1, total_len // 10)))
-    step = math.ceil(total_len / actual_n)
-    return [text[i: i + step] for i in range(0, total_len, step)]
-
-
-def _probe_features(chunks: list) -> list:
-    """信息熵探针: 防御连续空格等低熵信息攻击"""
-    features = []
-    for chunk in chunks:
-        # 惩罚因子
-        eff_len = len(chunk) - (chunk.count(' ') * 0.9)
-        features.append(max(eff_len, 0.1))
-    return features
+import re
+import zlib
 
 
 class CognitiveEngine:
     """
-    AI认知压力强度计算引擎
+    AI 认知压力与 ROI 审计引擎 (基于纯原生 Python)
+    核心机制: U型半衰期动态推导 + zlib 信息熵探针 + math.erf 连续定积分
     """
 
     def __init__(self, max_context: int = 128000):
         self.max_context = max_context
+        # 设定大模型绝对不发生注意力坍塌的安全Token阈值
+        self.T_HEAD_SAFE = 16000
+        self.T_TAIL_SAFE = 12000
 
     def _get_dynamic_params(self, t_obs: int) -> dict:
-        """推导当前上下文利用率下的U型衰减参数"""
+        # 动态参数推导
+        # 如果输入在安全区内，不产生任何架构损耗
+        if t_obs <= min(self.T_HEAD_SAFE, self.T_TAIL_SAFE):
+            return {"alpha": 1.0, "beta": 1.0, "k1": 0.0, "k2": 0.0}
+
+        # 计算安全区占总长度的百分比
+        x_half_head = max(self.T_HEAD_SAFE / t_obs, 0.05)
+        x_half_tail = max(self.T_TAIL_SAFE / t_obs, 0.05)
+
+        # 半衰期推导: k=ln(2)/x_half^2
+        ln_2 = 0.693147
+        k1 = ln_2 / (x_half_head ** 2)
+        k2 = ln_2 / (x_half_tail ** 2)
+
+        # Beta: 对话越多，模型越倾向关注最后一句话
         utilization = min(t_obs / self.max_context, 1.0)
+        beta = 1.0 + math.log1p(utilization)
 
-
-        return { # 基于个人经验的启发式参数
+        return {
             "alpha": 1.0,
-            "beta": round(1.0 + 0.5 * utilization, 2),  # 尾部权重
-            "k1": round(0.5 + 10.0 * (utilization ** 2), 2),
-            "k2": round(0.5 + 12.0 * (utilization ** 2), 2),
-            "power_p": 2.0 # 默认平滑参数=2.0
+            "beta": beta,
+            "k1": k1,
+            "k2": k2
         }
 
-    def calculate(self, chunks: list, t_obs: int) -> dict:
+    """使用误差函数计算定积分面积，O(1)复杂度"""
+    @staticmethod
+    def _integrate_gaussian(a: float, b: float, k: float, coef: float, is_tail: bool = False) -> float:
+        if k == 0:
+            return coef * (b - a)
 
-        if not chunks or t_obs <= 0:
-            return {"t_eff": 0, "bubble_rate": 0.0, "rn": 0.0}
+        integral_coef = math.sqrt(math.pi) / (2.0 * math.sqrt(k))
 
-        # 1. 参数获取与特征提取
+        if not is_tail:
+            # 头部曲线积分: int e^{-k x^2} dx
+            return coef * integral_coef * (math.erf(b * math.sqrt(k)) - math.erf(a * math.sqrt(k)))
+        else:
+            # 尾部曲线积分: int e^{-k (1-x)^2} dx
+            u_upper = 1.0 - a
+            u_lower = 1.0 - b
+            return coef * integral_coef * (math.erf(u_upper * math.sqrt(k)) - math.erf(u_lower * math.sqrt(k)))
+
+    def calculate(self, full_text: str, t_obs: int) -> dict:
+        """执行全链路认知损耗计算"""
+        if not full_text or t_obs <= 0:
+            return {"t_eff": 0, "bubble_rate": 0.0, "arch_bubble_rate": 0.0, "rn": 0.0, "params": {}}
+
+        # 1. 获取动态参数
         p = self._get_dynamic_params(t_obs)
-        features = _probe_features(chunks)
-        total_f = sum(features)
-        n = len(chunks)
+        max_possible_weight = max(p["alpha"], p["beta"])
 
-        power = p["power_p"]
+        # 2. 正则不定长语义切片
+        # 匹配任何非标点组成的句子，并带上其后的标点
+        matches = list(re.finditer(r'[^\n]+\n*', full_text))
+        total_len = len(full_text)
 
-        # 2. 计算位置权重
-        raw_weights = []
-        for i in range(n):
-            x = i / (n - 1) if n > 1 else 1.0
+        t_eff_arch_total = 0.0  # 仅由于大模型架构留存的 Token
+        t_eff_semantic_total = 0.0  # 结合人类废话后，最终真实的有效 Token
 
-            if i == 0:
-                w = p["alpha"]
+        for match in matches:
+            chunk = match.group()
+            # 获取该句子在物理全文中的位置比例[a, b]
+            a = match.start() / total_len
+            b = match.end() / total_len
+
+            if a == b: continue
+
+            # zlib探针
+            chunk_bytes = chunk.encode('utf-8-sig')
+            orig_len = len(chunk_bytes)
+            # 使用zlib进行压缩，压缩率越高，无用信息越多
+            comp_len = len(zlib.compress(chunk_bytes, level=6))
+            # 限制最高密度为1.0
+            density = min(1.0, comp_len / max(1, orig_len))
+
+            # 连续定积分计算
+            mid_point = (a + b) / 2.0
+            h_val = p["alpha"] * math.exp(-p["k1"] * (mid_point ** 2))
+            t_val = p["beta"] * math.exp(-p["k2"] * ((1.0 - mid_point) ** 2))
+
+            if h_val > t_val:
+                area = self._integrate_gaussian(a, b, p["k1"], p["alpha"], is_tail=False)
             else:
-                # 头部衰减: 从 x_i -> (x_i)^p
-                head_attn = p["alpha"] * math.exp(-p["k1"] * (x ** power))
-                # 尾部衰减: 从 (x_i - 1) -> -(1 - x_i)^p
-                tail_attn = p["beta"] * math.exp(-p["k2"] * ((1.0 - x) ** power))
+                area = self._integrate_gaussian(a, b, p["k2"], p["beta"], is_tail=True)
 
-                w = max(head_attn, tail_attn)
+            # 归一化面积，确保权重峰值严格 <= 1.0
+            normalized_area = area / max_possible_weight
 
-            raw_weights.append(w)
+            # 当前切片的物理基础Token
+            t_slice_base = t_obs * (b - a)
 
-        # 动态获取实际的最大合成权重，并严格将最高权重限制为 1.0
-        actual_max_w = max(raw_weights) if raw_weights else 1.0
-        normalized_weights = [min(1.0, w / actual_max_w) for w in raw_weights]
+            # 架构层面保留下来的 Token
+            arch_valid_tokens = t_obs * normalized_area
+            t_eff_arch_total += arch_valid_tokens
 
-        # 3. 积分求和
-        t_valid = 0.0
-        for i in range(n):
-            t_i = t_obs * (features[i] / total_f)  # 分配局部 Token 密度
-            t_valid += t_i * normalized_weights[i]
+            # 最终的真实有效 Token
+            t_eff_semantic_total += arch_valid_tokens * density
 
-        t_valid = int(t_valid)
-        rn = t_obs - t_valid
+        # 3. 数据结算
+        t_eff_semantic_total = int(t_eff_semantic_total)
+        t_eff_arch_total = int(t_eff_arch_total)
+
+        final_rn = t_obs - t_eff_semantic_total
 
         return {
             "t_obs": t_obs,
-            "t_eff": t_valid,
-            "rn": float(rn),
-            "bubble_rate": rn / t_obs if t_obs > 0 else 0.0,
-            "params": p  # 返回使用的参数，方便日志审计
+            "t_eff": t_eff_semantic_total,  # 最终实际有效 Token
+            "t_eff_arch": t_eff_arch_total,  # 理论架构最高有效 Token
+            "rn": float(final_rn),  # 总泡沫量
+            "bubble_rate": final_rn / t_obs,  # 总泡沫率
+            "arch_bubble_rate": (t_obs - t_eff_arch_total) / t_obs,  # 纯模型架构缺陷导致的泡沫率
+            "params": p
         }
