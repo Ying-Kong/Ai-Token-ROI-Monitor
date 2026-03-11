@@ -17,7 +17,7 @@ Ai-Token-ROI-Monitor是一款极轻量级(5KB)的token-ROI审计引擎，不干�
 1. 安装
 直接复制engine.py放入你的项目即可
 
-2.基础用法
+2. 基础用法
 
 ```python
 from engine import CognitiveEngine
