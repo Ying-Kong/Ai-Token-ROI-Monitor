@@ -6,6 +6,11 @@ from openai import OpenAI
 from engine import CognitiveEngine
 
 
+def get_persona() -> dict:
+    """读取人设与指令配置文件"""
+    with open("./persona.yml", "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
 def get_config() -> dict:
     """读取 API 配置文件"""
     with open("./api.yml", "r", encoding="utf-8") as f:
@@ -16,6 +21,7 @@ def get_config() -> dict:
 def deepseek(user_question: str) -> None:
     # 1. 初始化配置与认知引擎
     config = get_config()
+    persona = get_persona()
 
     # 从配置文件动态获取参数，设置默认值以防配置文件缺失字段
     api_key = config.get("api_key")
@@ -23,6 +29,10 @@ def deepseek(user_question: str) -> None:
     model_name = config.get("model", "deepseek-chat")
     max_ctx = config.get("max_context", 128000) # DeepSeek-V3.1的API依旧为128K，注意官网动态进行更改
 
+    user_name = persona.get("user_name", "好朋友")
+
+    system_content = persona.get("system_prompt", "").format(user=user_name)
+    instruction = persona.get("task_instruction", "").format(user=user_name)
     # 2. 初始化认知引擎与客户端
     # 这里动态传入从 yml文件读取的 max_context
     engine = CognitiveEngine(max_context=max_ctx)
@@ -35,38 +45,31 @@ def deepseek(user_question: str) -> None:
     target_file = "test.txt"
     log_file = "pressure_metrics.log"
 
-    # 2. 定义提示词内容
-    system_content = """
-    
-    """
-
     # 读取长文本背景
     if not os.path.exists(target_file):
-        with open(target_file, "w", encoding="utf-8-sig") as f:
+        with open(target_file, "w", encoding="utf-8") as f:
             f.write("")
-
-    with open(target_file, "r", encoding="utf-8-sig") as f:
+    with open(target_file, "r", encoding="utf-8") as f:
         user_content_history = f.read().strip()
 
-    # 1. {user_question}为此轮次{user}要说的话
+    # 2. 定义提示词内容
 
+    # {user_question}为此轮次{user}要说的话
+    # 构造本轮完整发送内容
     # 具体针对ai本轮任务的Prompt要求,{user_question}通过main.py的def deepseek()传参
-    latest_prompt_content = f"""
-    
-    {user_question}   
-    """
+    latest_prompt_content = f"{instruction}\n\n{user_question}"
 
     # 构建完整的消息列表
     messages = [
         {'role': 'system', 'content': system_content},
-        {'role': 'user', 'content': user_content_history + "\n" + latest_prompt_content},
+        {'role': 'user', 'content': f"{user_content_history}\n{latest_prompt_content}"},
     ]
 
     # 3. 构造数学计算用的高分辨率文本切片 ,用于计算注意力权重分布
     # 区块0: 系统指令
     full_text_for_engine = f"{system_content}\n{user_content_history}\n{latest_prompt_content}"
     # 计算输入总字节数
-    total_bytes = len(full_text_for_engine.encode("utf-8-sig"))
+    total_bytes = len(full_text_for_engine.encode("utf-8"))
 
     # 4. 发起流式API请求
     response = client.chat.completions.create(
@@ -93,7 +96,7 @@ def deepseek(user_question: str) -> None:
 
     # 5. 持久化响应内容
     if full_response_text:
-        with open(target_file, "a", encoding="utf-8-sig") as f:
+        with open(target_file, "a", encoding="utf-8") as f:
             f.write(f"\n\n[用户]: {user_question}")
             f.write(f"\n[AI]: {full_response_text}")
         print(f"响应内容已自动追加至文档: {target_file}")
