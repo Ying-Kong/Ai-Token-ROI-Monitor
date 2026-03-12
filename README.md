@@ -38,7 +38,7 @@ print(f"有效 Token: {metrics['t_eff']}"
 本工具并不帮你做决定，它只是在你的控制台挂一个**成本监控球**，让你在挥霍你的Token时，对烧掉的api额度有一个清晰的量化认知。
 
 ## 贡献与交流
-欢迎提交 Issue 或 Pull Request 来优化针对不同模型的**T_HEAD_SAFE和T_TAIL_SAFE**值参数。
+欢迎各位大佬提交 Issue 或 Pull Request 来优化针对不同模型的**T_HEAD_SAFE和T_TAIL_SAFE**值参数，个人小项目，有问题请直接批评。
 
 License: MIT
 Author: [Ying-Kong](https://github.com/Ying-Kong))
