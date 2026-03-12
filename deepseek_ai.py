@@ -53,7 +53,6 @@ def deepseek(user_question: str) -> None:
     # 具体针对ai本轮任务的Prompt要求,{user_question}通过main.py的def deepseek()传参
     latest_prompt_content = f"""
     
-    
     {user_question}   
     """
 
@@ -110,14 +109,18 @@ def deepseek(user_question: str) -> None:
                 lines = [line for line in lf.readlines() if line.strip()]
                 round_num = len(lines) + 1
 
+                diag = metrics["diagnostics"]
+
                 log_entry = (
-                    f"轮次:[{round_num:>3}] | "
+                    f"轮次:[{round_num:>4}] | "
                     f"时间:{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
-                    f"字节:{total_bytes:>6} | "
-                    f"Token:[总Token:{t_obs:>5} 有效Token:{metrics['t_eff']:>5}] | "
-                    f"总泡沫率:{metrics['bubble_rate']:>7.2%} |"
-                    f"架构底噪:{metrics['arch_bubble_rate']:>6.2%} | "
-                    f"衰减K值:[{metrics['params']['k1']:.3f}/{metrics['params']['k2']:.3f}]\n"
+                    f"Token:[总Token:{t_obs:>6} 有效Token:{metrics['t_eff']:>6}] | "
+                    f"泡沫率:{metrics['bubble_rate']:>7.2%} | "
+                    f"架构溢损:{metrics['arch_bubble_rate']:>7.2%} | "
+                    f"溢出点:[x={diag['valley_center']:>4.2f}] | "
+                    f"无效荷载区:[{diag['dead_zone_start']:>4.2f}至{diag['dead_zone_end']:>4.2f}] | "
+                    f"浪费Token:{diag['dead_zone_wasted']:>6} | "
+                    f"注意力衰减值:[{metrics['params']['k1']:>6.3f}/{metrics['params']['k2']:>6.3f}]\n"
                 )
 
         with open(log_file, "a", encoding="utf-8") as lf:
