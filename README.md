@@ -8,7 +8,7 @@ Ai-Token-ROI-Monitor是一款极轻量级(5KB)的token-ROI审计引擎，不干�
 ## 特性
 - 零依赖: 仅使用Python原生库，核心代码仅5KB
 - 非侵入式: 不修改Prompt，不拦截API请求，仅通过API返回的usage数据进行事后审计
-- 架构感知: 预设DeepSeek-V3.1，Gemini，ChatGPT等主流模型的安全参数，支持YAML动态调整
+- 架构感知: 预设DeepSeek-V3.2，Gemini，ChatGPT等主流模型的安全参数，支持YAML动态调整
 - 可视化日志: 自动生成日志报表，精确记录架构底噪与内容泡沫
 
 ## 快速开始
