@@ -1,19 +1,19 @@
 import math
-import re
 import zlib
-
 import yaml
 
 
 class CognitiveEngine:
     """
-    AI 认知压力与 ROI 审计引擎 (基于纯原生 Python)
-    核心机制: U型半衰期动态推导 + zlib 信息熵探针 + math.erf 连续定积分
+    AI 认知压力与 ROI 审计引擎 (混合架构与张量对齐完全体)
     """
 
-    def __init__(self, max_context: int = 128000):
+    def __init__(self, max_context: int = 128000, architecture: str = "hybrid", gamma: float = 0.25):
         self.max_context = max_context
-        # 设定大模型绝对不发生注意力坍塌的安全Token阈值
+        self.architecture = architecture
+        self.gamma = gamma if architecture == "hybrid" else 0.0
+        self.CHUNK_SIZE = 128  # 恒定步长，保证黎曼积分收敛
+
         with open("./api.yml", "r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
 
@@ -21,175 +21,98 @@ class CognitiveEngine:
         self.T_TAIL_SAFE = config["T_TAIL_SAFE"]
 
     def _get_dynamic_params(self, t_obs: int) -> dict:
-        # 动态参数推导
-        # 如果输入在安全区内，不产生任何架构损耗
         if t_obs <= min(self.T_HEAD_SAFE, self.T_TAIL_SAFE):
             return {"alpha": 1.0, "beta": 1.0, "k1": 0.0, "k2": 0.0}
 
-        # 计算安全区占总长度的百分比
-        x_half_head = max(self.T_HEAD_SAFE / t_obs, 0.05)
-        x_half_tail = max(self.T_TAIL_SAFE / t_obs, 0.05)
+        x_half_head = max(self.T_HEAD_SAFE / t_obs, 0.01)
+        x_half_tail = max(self.T_TAIL_SAFE / t_obs, 0.01)
 
-        # 半衰期推导: k=ln(2)/x_half^2
         ln_2 = 0.693147
-        k1 = ln_2 / (x_half_head ** 2)
-        k2 = ln_2 / (x_half_tail ** 2)
-
-        # Beta: 对话越多，模型越倾向关注最后一句话
-        utilization = min(t_obs / self.max_context, 1.0)
-        beta = 1.0 + math.log1p(utilization)
-
         return {
             "alpha": 1.0,
-            "beta": beta,
-            "k1": k1,
-            "k2": k2
+            "beta": 1.0 + math.log1p(min(t_obs / self.max_context, 1.0)),
+            "k1": ln_2 / (x_half_head ** 2),
+            "k2": ln_2 / (x_half_tail ** 2)
         }
 
-    """使用误差函数计算定积分面积，O(1)复杂度"""
     @staticmethod
     def _integrate_gaussian(a: float, b: float, k: float, coef: float, is_tail: bool = False) -> float:
-        if k == 0:
+        """核心高斯积分，确保 C0 连续性"""
+        if k == 0 or a >= b:
             return coef * (b - a)
 
         integral_coef = math.sqrt(math.pi) / (2.0 * math.sqrt(k))
 
         if not is_tail:
-            # 头部曲线积分: int e^{-k x^2} dx
             return coef * integral_coef * (math.erf(b * math.sqrt(k)) - math.erf(a * math.sqrt(k)))
         else:
-            # 尾部曲线积分: int e^{-k (1-x)^2} dx
-            u_upper = 1.0 - a
-            u_lower = 1.0 - b
-            return coef * integral_coef * (math.erf(u_upper * math.sqrt(k)) - math.erf(u_lower * math.sqrt(k)))
-
-    def calculate(self, full_text: str, t_obs: int) -> dict:
-        """执行全链路认知损耗计算"""
-        if not full_text or t_obs <= 0:
-            return {"t_eff": 0, "bubble_rate": 0.0, "arch_bubble_rate": 0.0, "rn": 0.0, "params": {}}
-
-        # 1. 获取动态参数
-        p = self._get_dynamic_params(t_obs)
-        max_possible_weight = max(p["alpha"], p["beta"])
-
-        # 2. 正则不定长语义切片
-        # 匹配任何非标点组成的句子，并带上其后的标点
-        matches = list(re.finditer(r'[^\n]+\n*', full_text))
-        total_len = len(full_text)
-
-        t_eff_arch_total = 0.0  # 仅由于大模型架构留存的 Token
-        t_eff_semantic_total = 0.0  # 结合人类废话后，最终真实的有效 Token
-
-        slice_records = [] # 初始化切片记录器
-
-        for match in matches:
-            chunk = match.group()
-            # 获取该句子在物理全文中的位置比例[a, b]
-            a = match.start() / total_len
-            b = match.end() / total_len
-
-            if a == b: continue
-
-            # zlib探针
-            chunk_bytes = chunk.encode('utf-8')
-            orig_len = len(chunk_bytes)
-            # 使用zlib进行压缩，压缩率越高，无用信息越多
-            comp_len = len(zlib.compress(chunk_bytes, level=1))
-
-            net_comp_len = max(0, comp_len - 11)
-            # 限制最高密度为1.0
-            density = min(1.0, net_comp_len / max(1, orig_len))
-
-            # 连续定积分计算
-            mid_point = (a + b) / 2.0
-            h_val = p["alpha"] * math.exp(-p["k1"] * (mid_point ** 2))
-            t_val = p["beta"] * math.exp(-p["k2"] * ((1.0 - mid_point) ** 2))
-
-            if h_val > t_val:
-                area = self._integrate_gaussian(a, b, p["k1"], p["alpha"], is_tail=False)
-            else:
-                area = self._integrate_gaussian(a, b, p["k2"], p["beta"], is_tail=True)
-
-            # 归一化面积，确保权重峰值严格 <= 1.0
-            normalized_area = area / max_possible_weight
-
-            # 当前切片的物理基础Token
-            t_slice_base = t_obs * (b - a)
-
-            # 架构层面保留下来的 Token
-            arch_valid_tokens = t_obs * normalized_area
-            slice_eff_semantic = arch_valid_tokens * density
-
-            t_eff_arch_total += arch_valid_tokens
-            # 最终的真实有效 Token
-            t_eff_semantic_total += slice_eff_semantic
-
-            slice_records.append({
-                "start_x": a,
-                "end_x": b,
-                "base_t": t_slice_base,
-                "eff_t": slice_eff_semantic
-            })
-
-        # 3. 数据结算
-        t_eff_semantic_total = int(t_eff_semantic_total)
-        t_eff_arch_total = int(t_eff_arch_total)
-        final_rn = t_obs - t_eff_semantic_total
-
-        x_min = self._find_attention_valley(p["k1"], p["k2"], p["beta"])
-        dead_zone = self._find_dead_zone(slice_records, theta=0.2)
-
-        return {
-            "t_obs": t_obs,
-            "t_eff": t_eff_semantic_total,  # 最终实际有效 Token
-            "t_eff_arch": t_eff_arch_total,  # 理论架构最高有效 Token
-            "rn": float(final_rn),  # 总泡沫量
-            "bubble_rate": final_rn / t_obs,  # 总泡沫率
-            "arch_bubble_rate": (t_obs - t_eff_arch_total) / t_obs,  # 纯模型架构缺陷导致的泡沫率
-            "params": p,
-            "diagnostics": {
-                "valley_center": x_min,
-                "dead_zone_start": dead_zone["start_x"],
-                "dead_zone_end": dead_zone["end_x"],
-                "dead_zone_wasted": dead_zone["wasted_tokens"]
-            }
-        }
+            return coef * integral_coef * (math.erf((1.0 - a) * math.sqrt(k)) - math.erf((1.0 - b) * math.sqrt(k)))
 
     @staticmethod
     def _find_attention_valley(k1: float, k2: float, beta: float) -> float:
-        """
-        求解 U型注意力包络线的全局极小值点物理坐标 (x_min)
-        方程: (k1 - k2)x^2 + 2*k2*x - (k2 + ln(beta)) = 0
-        """
-        if k1 == 0 and k2 == 0:
-            return 0.5  # 在安全区内，没有明显谷底，默认中点
-
+        """求解 U 型包络线极小值交叉点"""
         if abs(k1 - k2) < 1e-9:
-            # k1 == k2 时的退化一元一次方程
-            x_min = 0.5 - math.log(beta) / (2 * k2) if k2 != 0 else 0.5
-        else:
-            # 求解一元二次方程
-            a = k1 - k2
-            b = 2 * k2
-            c = math.log(beta) - k2
-            delta = b ** 2 - 4 * a * c
+            return max(0.0, min(1.0, 0.5 - math.log(beta) / (2 * max(k2, 1e-9))))
 
-            if delta >= 0:
-                root1 = (-b + math.sqrt(delta)) / (2 * a)
-                root2 = (-b - math.sqrt(delta)) / (2 * a)
-                # 取位于物理坐标 [0, 1] 内的有效解
-                x_min = root1 if 0.0 <= root1 <= 1.0 else root2
+        a, b_param, c = k1 - k2, 2 * k2, math.log(beta) - k2
+        delta = b_param ** 2 - 4 * a * c
+
+        if delta >= 0:
+            roots = [r for r in ((-b_param + math.sqrt(delta)) / (2 * a), (-b_param - math.sqrt(delta)) / (2 * a)) if
+                     0.0 <= r <= 1.0]
+            if roots:
+                return roots[0]
+        return 0.5
+
+    @staticmethod
+    def _build_token_manifold(full_text: str) -> tuple[list[float], int]:
+        """构建物理字符空间到 BBPE 张量空间的非线性流形映射"""
+        total_chars = len(full_text)
+        if total_chars == 0:
+            return [], 0
+
+        cdf = [0.0] * total_chars
+        current_token_acc = 0.0
+
+        consecutive_spaces = 0
+        consecutive_alnum = 0
+
+        for i, char in enumerate(full_text):
+            byte_len = len(char.encode('utf-8'))
+            weight = 0.0
+
+            if char.isspace():
+                consecutive_alnum = 0
+                consecutive_spaces += 1
+                # 对数衰减拟合 BBPE 连续空格合并
+                weight = 1.0 / math.log(math.e + consecutive_spaces * 2.0)
+            elif char.isalnum() and byte_len == 1:
+                consecutive_spaces = 0
+                consecutive_alnum += 1
+                # 拟合英文单词压缩率
+                weight = max(0.25, 1.0 / math.log(math.e + consecutive_alnum))
             else:
-                x_min = 0.5  # 理论防线，正常参数不会走到这里
+                consecutive_spaces = 0
+                consecutive_alnum = 0
+                if byte_len == 3:
+                    weight = 0.8  # CJK 基础权重
+                else:
+                    weight = byte_len * 0.5
 
-        return max(0.0, min(1.0, x_min))
+            current_token_acc += weight
+            cdf[i] = current_token_acc
+
+        estimated_total_tokens = int(current_token_acc)
+
+        # 归一化至 [0, 1] 物理张量坐标
+        for i in range(total_chars):
+            cdf[i] = cdf[i] / current_token_acc if current_token_acc > 0 else 0.0
+
+        return cdf, estimated_total_tokens
 
     @staticmethod
     def _find_dead_zone(slices: list, theta: float = 0.2) -> dict:
-        """
-        使用 Kadane 算法动态规划，寻找绝对沉没成本最大的连续物理区间
-        theta: 最低容忍 ROI 阈值 (如 0.2，表示低于 20% 有效率即视为死区)
-        """
+        """Kadane 算法寻找最大连续 ROI 沉没区间"""
         max_so_far = 0.0
         current_max = 0.0
         best_start_idx = 0
@@ -197,11 +120,7 @@ class CognitiveEngine:
         current_start_idx = 0
 
         for i, s in enumerate(slices):
-            # 单个切片的 ROI
             v_k = s['eff_t'] / s['base_t'] if s['base_t'] > 0 else 1.0
-
-            # 收益函数 = 基础Token * (1 - 实际ROI / 容忍阈值)
-            # 物理意义：如果一段文本极度无聊 (v_k < theta)，则视为正向发现；如果很有用，产生负向惩罚
             benefit = s['base_t'] * (1.0 - v_k / theta)
 
             if current_max + benefit < 0:
@@ -216,7 +135,6 @@ class CognitiveEngine:
                 best_end_idx = i
 
         if max_so_far > 0 and best_end_idx >= best_start_idx:
-            # 汇总该死区内的统计数据
             dead_base = sum(s['base_t'] for s in slices[best_start_idx:best_end_idx + 1])
             dead_eff = sum(s['eff_t'] for s in slices[best_start_idx:best_end_idx + 1])
             return {
@@ -227,3 +145,99 @@ class CognitiveEngine:
             }
 
         return {"start_x": 0.0, "end_x": 0.0, "dead_tokens": 0, "wasted_tokens": 0}
+
+    def calculate(self, full_text: str, t_obs: int = 0) -> dict:
+        if not full_text:
+            return {"t_eff": 0, "bubble_rate": 0.0, "arch_bubble_rate": 0.0, "rn": 0.0, "params": {}}
+
+        cdf, est_total_tokens = self._build_token_manifold(full_text)
+        actual_t_obs = t_obs if t_obs > 0 else est_total_tokens
+
+        if actual_t_obs <= 0:
+            return {"t_eff": 0, "bubble_rate": 0.0, "arch_bubble_rate": 0.0, "rn": 0.0, "params": {}}
+
+        p = self._get_dynamic_params(actual_t_obs)
+        x_min = self._find_attention_valley(p["k1"], p["k2"], p["beta"])
+
+        # 挂载有状态 Zlib 探针以计算全局条件熵
+        compressor = zlib.compressobj(level=1)
+
+        total_len = len(full_text)
+        t_eff_arch_total = 0.0
+        t_eff_semantic_total = 0.0
+        slice_records = []
+
+        # 定长步进扫描，维持微积分 Delta x 恒定
+        for i in range(0, total_len, self.CHUNK_SIZE):
+            chunk = full_text[i: i + self.CHUNK_SIZE]
+
+            # 张量坐标提取
+            a = cdf[i] if i > 0 else 0.0
+            end_idx = min(i + self.CHUNK_SIZE, total_len - 1)
+            b = cdf[end_idx]
+
+            if a >= b:
+                continue
+
+            interval_len = b - a
+
+            # Z_SYNC_FLUSH 触发有状态字典增量输出
+            chunk_bytes = chunk.encode('utf-8')
+            orig_bytes_len = max(len(chunk_bytes), 1)
+            compressed_chunk_bytes = compressor.compress(chunk_bytes) + compressor.flush(zlib.Z_SYNC_FLUSH)
+
+            # 扣除 Z_SYNC_FLUSH 基础开销
+            net_delta_len = max(0, len(compressed_chunk_bytes) - 5)
+            density = min(1.0, net_delta_len / orig_bytes_len)
+
+            # 跨极小值点的绝对连续性积分拆分
+            ssm_area = 0.0
+            if b <= x_min:
+                ssm_area = self._integrate_gaussian(a, b, p["k1"], p["alpha"], is_tail=False)
+            elif a >= x_min:
+                ssm_area = self._integrate_gaussian(a, b, p["k2"], p["beta"], is_tail=True)
+            else:
+                ssm_area = (self._integrate_gaussian(a, x_min, p["k1"], p["alpha"], is_tail=False) +
+                            self._integrate_gaussian(x_min, b, p["k2"], p["beta"], is_tail=True))
+
+            ssm_area = min(interval_len, ssm_area)
+
+            # Transformer 均匀覆盖概率叠加
+            hybrid_arch_area = (1.0 - self.gamma) * ssm_area + self.gamma * interval_len
+            arch_valid_tokens = actual_t_obs * hybrid_arch_area
+
+            # 单次条件熵剥离，计算真实语义 Token
+            slice_eff_semantic = arch_valid_tokens * density
+
+            t_eff_arch_total += arch_valid_tokens
+            t_eff_semantic_total += slice_eff_semantic
+
+            slice_records.append({
+                "start_x": a,
+                "end_x": b,
+                "base_t": actual_t_obs * interval_len,
+                "eff_t": slice_eff_semantic
+            })
+
+        t_eff_semantic_total = int(t_eff_semantic_total)
+        t_eff_arch_total = int(t_eff_arch_total)
+        final_rn = max(0, actual_t_obs - t_eff_semantic_total)
+
+        dead_zone = self._find_dead_zone(slice_records, theta=0.2)
+
+        return {
+            "总观测_Token": actual_t_obs,
+            "最终语义有效_Token": t_eff_semantic_total,
+            "架构理论留存_Token": t_eff_arch_total,
+            "总认知泡沫量": float(final_rn),
+            "全局泡沫率": final_rn / max(1, actual_t_obs),
+            "纯架构缺陷泡沫率": max(0.0, (actual_t_obs - t_eff_arch_total) / max(1, actual_t_obs)),
+            "动力学推导参数": p,
+            "混合架构_Gamma_权重": self.gamma,
+            "深度拓扑诊断": {
+                "注意力谷底坐标": x_min,
+                "认知死区起点": dead_zone["start_x"],
+                "认知死区终点": dead_zone["end_x"],
+                "死区沉没成本_Token": dead_zone.get("wasted_tokens", 0)
+            }
+        }
