@@ -1,4 +1,4 @@
-# Ai-Token-ROI-Monitor
+# AiTokenROIMonitor
 
 ## 简介
 在如今的超长上下文AI时代，大模型即便拥有1M的上下文窗口，其注意力分布也并非完全均匀，由于Lost in the Middle现象及KV Cache压缩策略，大量位于上下文窗口中部的Token虽然被计费，但对模型最终输出的贡献微乎其微
@@ -8,7 +8,7 @@ Ai-Token-ROI-Monitor是一款极轻量级(5KB)的token-ROI审计引擎，不干�
 ## 特性
 - 零依赖: 仅使用Python原生库，核心代码仅5KB
 - 非侵入式: 不修改Prompt，不拦截API请求，仅通过API返回的usage数据进行事后审计
-- 架构感知: 预设DeepSeek-V3.1，Gemini，ChatGPT等主流模型的安全参数，支持YAML动态调整
+- 架构感知: 预设DeepSeek-V3.2，Gemini，ChatGPT等主流模型的安全参数，支持YAML动态调整
 - 可视化日志: 自动生成日志报表，精确记录架构底噪与内容泡沫
 
 ## 快速开始
