@@ -208,3 +208,5 @@ __marimo__/
 api.yml
 test.txt
 *.log
+web/node_modules/
+web/package-lock.json
