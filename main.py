@@ -17,7 +17,7 @@ def deepseek_main():
 
         while True:
                 try:
-                        user_input = input("\n").strip()
+                        user_input = input("\n>>>.").strip()
                         if user_input.lower() in ["quit", "exit"]:
                                 logging.info("安全退出，本轮任务已结束。")
                                 break
