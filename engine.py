@@ -5,14 +5,14 @@ import yaml
 
 class CognitiveEngine:
     """
-    AI 认知压力与 ROI 审计引擎 (混合架构与张量对齐完全体)
+    AiTokenROI拟合计算，无多余的侵入性操作，不修改、裁剪任何Prompt或者对话内容，无RAG检索
     """
 
     def __init__(self, max_context: int = 128000, architecture: str = "hybrid", gamma: float = 0.25):
         self.max_context = max_context
         self.architecture = architecture
         self.gamma = gamma if architecture == "hybrid" else 0.0
-        self.CHUNK_SIZE = 128  # 恒定步长，保证黎曼积分收敛
+        self.CHUNK_SIZE = 128  # 恒定步长，保证积分收敛
 
         with open("./api.yml", "r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
@@ -37,7 +37,7 @@ class CognitiveEngine:
 
     @staticmethod
     def _integrate_gaussian(a: float, b: float, k: float, coef: float, is_tail: bool = False) -> float:
-        """核心高斯积分，确保 C0 连续性"""
+        """拟合注意力遗忘区和有效 Token 计算"""
         if k == 0 or a >= b:
             return coef * (b - a)
 
@@ -50,7 +50,7 @@ class CognitiveEngine:
 
     @staticmethod
     def _find_attention_valley(k1: float, k2: float, beta: float) -> float:
-        """求解 U 型包络线极小值交叉点"""
+        """注意力遗忘区内的最低点坐标计算"""
         if abs(k1 - k2) < 1e-9:
             return max(0.0, min(1.0, 0.5 - math.log(beta) / (2 * max(k2, 1e-9))))
 
@@ -66,7 +66,7 @@ class CognitiveEngine:
 
     @staticmethod
     def _build_token_manifold(full_text: str) -> tuple[list[float], int]:
-        """构建物理字符空间到 BBPE 张量空间的非线性流形映射"""
+        """Token 压缩映射，模拟分词器算法"""
         total_chars = len(full_text)
         if total_chars == 0:
             return [], 0
@@ -84,18 +84,18 @@ class CognitiveEngine:
             if char.isspace():
                 consecutive_alnum = 0
                 consecutive_spaces += 1
-                # 对数衰减拟合 BBPE 连续空格合并
+                # 拟合 BBPE 的连续空格合并
                 weight = 1.0 / math.log(math.e + consecutive_spaces * 2.0)
             elif char.isalnum() and byte_len == 1:
                 consecutive_spaces = 0
                 consecutive_alnum += 1
-                # 拟合英文单词压缩率
+                # 拟合英文压缩率
                 weight = max(0.25, 1.0 / math.log(math.e + consecutive_alnum))
             else:
                 consecutive_spaces = 0
                 consecutive_alnum = 0
                 if byte_len == 3:
-                    weight = 0.8  # CJK 基础权重
+                    weight = 0.8  # 拟合中文压缩率，CJK 的基础权重
                 else:
                     weight = byte_len * 0.5
 
@@ -104,7 +104,7 @@ class CognitiveEngine:
 
         estimated_total_tokens = int(current_token_acc)
 
-        # 归一化至 [0, 1] 物理张量坐标
+        # 归一化至[0,1]
         for i in range(total_chars):
             cdf[i] = cdf[i] / current_token_acc if current_token_acc > 0 else 0.0
 
@@ -112,7 +112,7 @@ class CognitiveEngine:
 
     @staticmethod
     def _find_dead_zone(slices: list, theta: float = 0.2) -> dict:
-        """Kadane 算法寻找最大连续 ROI 沉没区间"""
+        """Kadane 算法寻找最大连续无效 Token 存在区间"""
         max_so_far = 0.0
         current_max = 0.0
         best_start_idx = 0
@@ -159,7 +159,7 @@ class CognitiveEngine:
         p = self._get_dynamic_params(actual_t_obs)
         x_min = self._find_attention_valley(p["k1"], p["k2"], p["beta"])
 
-        # 挂载有状态 Zlib 探针以计算全局条件熵
+        # 状态 Zlib 计算信息压缩度
         compressor = zlib.compressobj(level=1)
 
         total_len = len(full_text)
@@ -167,11 +167,10 @@ class CognitiveEngine:
         t_eff_semantic_total = 0.0
         slice_records = []
 
-        # 定长步进扫描，维持微积分 Delta x 恒定
+        # 定长步进扫描，维持微积分 δ_x 恒定
         for i in range(0, total_len, self.CHUNK_SIZE):
             chunk = full_text[i: i + self.CHUNK_SIZE]
 
-            # 张量坐标提取
             a = cdf[i] if i > 0 else 0.0
             end_idx = min(i + self.CHUNK_SIZE, total_len - 1)
             b = cdf[end_idx]
@@ -181,7 +180,6 @@ class CognitiveEngine:
 
             interval_len = b - a
 
-            # Z_SYNC_FLUSH 触发有状态字典增量输出
             chunk_bytes = chunk.encode('utf-8')
             orig_bytes_len = max(len(chunk_bytes), 1)
             compressed_chunk_bytes = compressor.compress(chunk_bytes) + compressor.flush(zlib.Z_SYNC_FLUSH)
@@ -190,7 +188,6 @@ class CognitiveEngine:
             net_delta_len = max(0, len(compressed_chunk_bytes) - 5)
             density = min(1.0, net_delta_len / orig_bytes_len)
 
-            # 跨极小值点的绝对连续性积分拆分
             ssm_area = 0.0
             if b <= x_min:
                 ssm_area = self._integrate_gaussian(a, b, p["k1"], p["alpha"], is_tail=False)
@@ -206,7 +203,7 @@ class CognitiveEngine:
             hybrid_arch_area = (1.0 - self.gamma) * ssm_area + self.gamma * interval_len
             arch_valid_tokens = actual_t_obs * hybrid_arch_area
 
-            # 单次条件熵剥离，计算真实语义 Token
+            # 计算真实语义 Token
             slice_eff_semantic = arch_valid_tokens * density
 
             t_eff_arch_total += arch_valid_tokens
