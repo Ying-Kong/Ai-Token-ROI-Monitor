@@ -1,24 +1,32 @@
 import math
 import zlib
-import yaml
+import re
+from collections import deque
 
 
 class CognitiveEngine:
     """
-    AiTokenROI拟合计算，无多余的侵入性操作，不修改、裁剪任何Prompt或者对话内容，无RAG检索
+    AiTokenROI拟合计算，不加载tiktoken和Embedding模型，无语义匹配，无多余的侵入性操作，不修改、裁剪、增添任何Prompt或者对话内容
+
+    核心逻辑: 通过“注意力差”与“信息熵密度”拟合真实Token利用率
+
+    1. 泡沫Token: 由于模型架构和文本冗余导致的无效Token
+    2. 计算公式: Token = ∑ (片段长度 * 注意力权重 * Zlib 压缩密度),
+    $$Token_{eff} = \sum (L_i \cdot W_{attn, i} \cdot D_{density, i})$$
+    3. 拟合计算引擎基于 Transformer 物理特性建模。修改参数仅会扭曲度量结果，无法修改模型实际的认知坍塌规律
+
     """
+    # 唯一对外定义的元数据，用于存证
+    ALGO_IDENTITY = "CognitiveROI: Entropy-based Attention Audit"
+
 
     def __init__(self, max_context: int = 128000, architecture: str = "hybrid", gamma: float = 0.25):
         self.max_context = max_context
         self.architecture = architecture
         self.gamma = gamma if architecture == "hybrid" else 0.0
-        self.CHUNK_SIZE = 128  # 恒定步长，保证积分收敛
-
-        with open("./api.yml", "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f)
-
-        self.T_HEAD_SAFE = config["T_HEAD_SAFE"]
-        self.T_TAIL_SAFE = config["T_TAIL_SAFE"]
+        self.CHUNK_SIZE = 128
+        self.T_HEAD_SAFE = 16000
+        self.T_TAIL_SAFE = 12000
 
     def _get_dynamic_params(self, t_obs: int) -> dict:
         if t_obs <= min(self.T_HEAD_SAFE, self.T_TAIL_SAFE):
@@ -54,7 +62,7 @@ class CognitiveEngine:
         if abs(k1 - k2) < 1e-9:
             return max(0.0, min(1.0, 0.5 - math.log(beta) / (2 * max(k2, 1e-9))))
 
-        a, b_param, c = k1 - k2, 2 * k2, math.log(beta) - k2
+        a, b_param, c = k2 - k1, 2 * k2, math.log(beta) - k2
         delta = b_param ** 2 - 4 * a * c
 
         if delta >= 0:
@@ -74,39 +82,50 @@ class CognitiveEngine:
         cdf = [0.0] * total_chars
         current_token_acc = 0.0
 
-        consecutive_spaces = 0
-        consecutive_alnum = 0
+        for match in re.finditer(r'(\s+)|([a-zA-Z0-9]+)|([^\sa-zA-Z0-9]+)', full_text):
+            start, end = match.span()
+            spaces, alnums, others = match.groups()
 
-        for i, char in enumerate(full_text):
-            byte_len = len(char.encode('utf-8'))
-            weight = 0.0
+            length = end - start
 
-            if char.isspace():
-                consecutive_alnum = 0
-                consecutive_spaces += 1
-                # 拟合 BBPE 的连续空格合并
-                weight = 1.0 / math.log(math.e + consecutive_spaces * 2.0)
-            elif char.isalnum() and byte_len == 1:
-                consecutive_spaces = 0
-                consecutive_alnum += 1
-                # 拟合英文压缩率
-                weight = max(0.25, 1.0 / math.log(math.e + consecutive_alnum))
-            else:
-                consecutive_spaces = 0
-                consecutive_alnum = 0
-                if byte_len == 3:
-                    weight = 0.8  # 拟合中文压缩率，CJK 的基础权重
+            if spaces:
+                for i in range(length):
+                    current_token_acc += 0.05 + 0.95 * math.exp(-0.5 * (i + 1))
+                    cdf[start + i] = current_token_acc
+
+            elif alnums:
+                FIXED_ALNUM_WEIGHT = 0.30
+
+                for i in range(length):
+                    weight_val = max(FIXED_ALNUM_WEIGHT, 0.25 + 0.75 * math.exp(-0.5 * (i + 1)))
+
+                    current_token_acc += weight_val
+                    cdf[start + i] = current_token_acc
+            elif others:
+                encoded_bytes_len = len(others.encode('utf-8'))
+                avg_bytes = encoded_bytes_len / length
+
+                # 依据平均字节数快速断定 CJK 或 特殊符号
+                if avg_bytes >= 2.5:
+                    # 判定为 CJK, UTF-8下汉字通常为 3 bytes
+                    # 1.32为最新LLM的平均 Token, 1字符 ≈ 1.32Token
+                    weight = 1.32
+                elif avg_bytes >= 1.5:
+                    # 针对双字节字符（如拉丁扩展、部分符号、俄语等）
+                    weight = 1.1
                 else:
-                    weight = byte_len * 0.5
-
-            current_token_acc += weight
-            cdf[i] = current_token_acc
+                    # 针对单字节特殊符号
+                    weight = 0.55
+                for i in range(length):
+                    current_token_acc += weight
+                    cdf[start + i] = current_token_acc
 
         estimated_total_tokens = int(current_token_acc)
 
         # 归一化至[0,1]
-        for i in range(total_chars):
-            cdf[i] = cdf[i] / current_token_acc if current_token_acc > 0 else 0.0
+        if current_token_acc > 0:
+            inv_acc = 1.0 / current_token_acc
+            cdf = [val * inv_acc for val in cdf]
 
         return cdf, estimated_total_tokens
 
@@ -146,7 +165,36 @@ class CognitiveEngine:
 
         return {"start_x": 0.0, "end_x": 0.0, "dead_tokens": 0, "wasted_tokens": 0}
 
-    def calculate(self, full_text: str, t_obs: int = 0) -> dict:
+    @staticmethod
+    def _compute_simhash(text: str) -> int:
+        """轻量级 SimHash 计算：将文本映射为 64-bit 语义指纹"""
+        if not text:
+            return 0
+
+        v = [0] * 64
+        encoded_text = memoryview(text.encode('utf-8'))
+        length = len(encoded_text)
+        # 使用 3-gram 切片提取局部特征
+        for i in range(max(1, len(text) - 2)):
+            gram = encoded_text[i:i + 3] if len(text) >= 3 else encoded_text
+            h = zlib.crc32(gram)
+            for j in range(64):
+                if (h >> j) & 1:
+                    v[j] += 1
+                else:
+                    v[j] -= 1
+
+        fingerprint = 0
+        for j in range(64):
+            if v[j] > 0:
+                fingerprint |= (1 << j)
+        return fingerprint
+
+    @staticmethod
+    def _hamming_distance(h1: int, h2: int) -> int:
+        return (h1 ^ h2).bit_count()
+
+    def calculate(self, full_text: str, t_obs: int = 0, ssm_lambda: float = None) -> dict:
         if not full_text:
             return {"t_eff": 0, "bubble_rate": 0.0, "arch_bubble_rate": 0.0, "rn": 0.0, "params": {}}
 
@@ -166,42 +214,70 @@ class CognitiveEngine:
         t_eff_arch_total = 0.0
         t_eff_semantic_total = 0.0
         slice_records = []
+        total_chunks = actual_t_obs / self.CHUNK_SIZE
+        horizon_size = max(64, int(total_chunks * 0.2))
+        history_horizon = deque(maxlen=horizon_size)
+        GLOBAL_PENALTY = 0.45
 
         # 定长步进扫描，维持微积分 δ_x 恒定
         for i in range(0, total_len, self.CHUNK_SIZE):
             chunk = full_text[i: i + self.CHUNK_SIZE]
 
-            a = cdf[i] if i > 0 else 0.0
-            end_idx = min(i + self.CHUNK_SIZE, total_len - 1)
+            a = cdf[i - 1] if i > 0 else 0.0
+            end_idx = min(i + self.CHUNK_SIZE - 1, total_len - 1)
             b = cdf[end_idx]
 
             if a >= b:
                 continue
 
             interval_len = b - a
-
             chunk_bytes = chunk.encode('utf-8')
             orig_bytes_len = max(len(chunk_bytes), 1)
             compressed_chunk_bytes = compressor.compress(chunk_bytes) + compressor.flush(zlib.Z_SYNC_FLUSH)
 
-            # 扣除 Z_SYNC_FLUSH 基础开销
+            # 扣除 z_sync_flush 基础开销
             net_delta_len = max(0, len(compressed_chunk_bytes) - 5)
             density = min(1.0, net_delta_len / orig_bytes_len)
 
-            ssm_area = 0.0
-            if b <= x_min:
-                ssm_area = self._integrate_gaussian(a, b, p["k1"], p["alpha"], is_tail=False)
-            elif a >= x_min:
-                ssm_area = self._integrate_gaussian(a, b, p["k2"], p["beta"], is_tail=True)
+            pure_chars = "".join([c for c in chunk if c.isalnum()])
+            if len(pure_chars) >= 32:
+                chunk_simhash = self._compute_simhash(pure_chars)
+                is_redundant = False
+
+                for hist_hash in history_horizon:
+                    if self._hamming_distance(chunk_simhash, hist_hash) <= 3:
+                        is_redundant = True
+                        break
+
+                if is_redundant:
+                    density *= GLOBAL_PENALTY  # 补充Zlib 32K的范围限制，Hash全局命中重复信息，大幅降低信息密度
+                else:
+                    # 限制大小，防止超长上下文带来的 O(N^2)
+                    history_horizon.append(chunk_simhash)
+
+            # ssm_lambda逻辑判定
+            if ssm_lambda is None:
+                # 根据当前观测长度与最大窗口的比例，自动计算物理坍塌系数
+                ssm_lambda = 3.0 * (actual_t_obs / self.max_context) ** 2
             else:
-                ssm_area = (self._integrate_gaussian(a, x_min, p["k1"], p["alpha"], is_tail=False) +
+                # 根据特定模型手动指定参数
+                pass
+
+            area = 0.0
+            if b <= x_min:
+                area = self._integrate_gaussian(a, b, p["k1"], p["alpha"], is_tail=False)
+            elif a >= x_min:
+                area = self._integrate_gaussian(a, b, p["k2"], p["beta"], is_tail=True)
+            else:
+                area = (self._integrate_gaussian(a, x_min, p["k1"], p["alpha"], is_tail=False) +
                             self._integrate_gaussian(x_min, b, p["k2"], p["beta"], is_tail=True))
 
-            ssm_area = min(interval_len, ssm_area)
+            transformer_prob = min(1.0, area / interval_len) if interval_len > 0 else 0.0
+            ssm_prob = math.exp(-ssm_lambda * (1.0 - b))
 
             # Transformer 均匀覆盖概率叠加
-            hybrid_arch_area = (1.0 - self.gamma) * ssm_area + self.gamma * interval_len
-            arch_valid_tokens = actual_t_obs * hybrid_arch_area
+            hybrid_retention_prob = (1.0 - self.gamma) * transformer_prob + self.gamma * ssm_prob
+            arch_valid_tokens = actual_t_obs * interval_len * hybrid_retention_prob
 
             # 计算真实语义 Token
             slice_eff_semantic = arch_valid_tokens * density
@@ -217,24 +293,31 @@ class CognitiveEngine:
             })
 
         t_eff_semantic_total = int(t_eff_semantic_total)
-        t_eff_arch_total = int(t_eff_arch_total)
+        t_eff_arch_total = round(t_eff_arch_total)
         final_rn = max(0, actual_t_obs - t_eff_semantic_total)
 
         dead_zone = self._find_dead_zone(slice_records, theta=0.2)
 
         return {
-            "总观测_Token": actual_t_obs,
-            "最终语义有效_Token": t_eff_semantic_total,
-            "架构理论留存_Token": t_eff_arch_total,
-            "总认知泡沫量": float(final_rn),
-            "全局泡沫率": final_rn / max(1, actual_t_obs),
-            "纯架构缺陷泡沫率": max(0.0, (actual_t_obs - t_eff_arch_total) / max(1, actual_t_obs)),
+            "总观测_Token": actual_t_obs, # API JSON返回的全部 Token
+            "最终语义有效_Token": t_eff_semantic_total, # 模型真正理解并思考输出的有意义 Token
+            "架构理论留存_Token": t_eff_arch_total, # LLM始终记忆的 Token
+            "总认知泡沫量": float(final_rn), # 低信息熵的 Token 总数
+            "全局泡沫率": final_rn / max(1, actual_t_obs), # LLM由于冗余对话，导致的泡沫 Token 在 All_Token 内的占比
+            "纯架构缺陷泡沫率": max(0.0, (actual_t_obs - t_eff_arch_total) / max(1, actual_t_obs)), # LLM的底层架构造成的 Token 损失
             "动力学推导参数": p,
-            "混合架构_Gamma_权重": self.gamma,
+            # 包含α, β, k1, k2
+            # α: 头部权重系数
+            # β: 尾部增强系数
+            # k1: 头部注意力衰减率
+            # k2: 尾部注意力衰减度
+            "混合架构_Gamma_权重": self.gamma, # 混合架构（Transformer和SSM）的拟合参数
             "深度拓扑诊断": {
                 "注意力谷底坐标": x_min,
+                # [start_x,end_x]，LLM在全局对话中注意力遗失的区域
                 "认知死区起点": dead_zone["start_x"],
                 "认知死区终点": dead_zone["end_x"],
+                # 在遗忘区内被计算的无用 Token
                 "死区沉没成本_Token": dead_zone.get("wasted_tokens", 0)
             }
         }
