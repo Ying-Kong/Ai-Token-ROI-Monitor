@@ -3,7 +3,7 @@
 ## 简介
 在如今的超长上下文AI时代，大模型即便拥有1M的上下文窗口，其注意力分布也并非完全均匀，由于Lost in the Middle现象及KV Cache压缩策略，大量位于上下文窗口中部的Token虽然被计费，但对模型最终输出的贡献微乎其微
 
-Ai-Token-ROI-Monitor是一款极轻量级(5KB)的token-ROI审计引擎，不干预用户Prompt，只客观告知使用者当前对话中有多少钱是花在无效Token上
+Ai-Token-ROI-Monitor是一款极轻量级(15KB)的token-ROI审计引擎，不干预用户Prompt，只客观告知使用者当前对话中有多少钱是花在无效Token上
 
 ## 特性
 - 零依赖: 仅使用Python原生库，核心代码仅5KB
