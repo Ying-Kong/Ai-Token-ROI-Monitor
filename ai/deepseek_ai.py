@@ -6,12 +6,12 @@ from engine import CognitiveEngine
 
 
 def get_persona() -> dict:
-    with open("./persona.yml", "r", encoding="utf-8") as f:
+    with open("../persona.yml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def get_config() -> dict:
-    with open("./api.yml", "r", encoding="utf-8") as f:
+    with open("../api.yml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -34,8 +34,8 @@ def deepseek(user_question: str) -> None:
 
     client = OpenAI(api_key=api_key, base_url=base_url)
 
-    target_file = "test.txt"
-    log_file = "pressure_metrics.log"
+    target_file = "../test.txt"
+    log_file = "../test.log"
 
     # 读取长文本背景
     if not os.path.exists(target_file):
@@ -81,7 +81,7 @@ def deepseek(user_question: str) -> None:
     # 持久化响应内容
     if full_response_text:
         with open(target_file, "a", encoding="utf-8") as f:
-            # 增加换行符避免与下一次历史读取黏连
+            # 增加换行符避免与下一次历史读取粘连
             f.write(f"\n[用户]: {user_question}\n")
             f.write(f"[AI]: {full_response_text}\n")
         print(f"响应内容已自动追加至文档: {target_file}")
