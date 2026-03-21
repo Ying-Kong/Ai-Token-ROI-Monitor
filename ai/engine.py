@@ -7,7 +7,6 @@ from collections import deque
 class CognitiveEngine:
     """
     AiTokenROI拟合计算，不加载tiktoken和Embedding模型，无语义匹配，无多余的侵入性操作，不修改、裁剪、增添任何Prompt或者对话内容
-
     核心逻辑: 通过“注意力差”与“信息熵密度”拟合真实Token利用率
 
     1. 泡沫Token: 由于模型架构和文本冗余导致的无效Token
@@ -175,14 +174,20 @@ class CognitiveEngine:
         encoded_text = memoryview(text.encode('utf-8'))
         length = len(encoded_text)
         # 使用 3-gram 切片提取局部特征
-        for i in range(max(1, len(text) - 2)):
-            gram = encoded_text[i:i + 3] if len(text) >= 3 else encoded_text
-            h = zlib.crc32(gram)
-            for j in range(64):
-                if (h >> j) & 1:
+        for i in range(max(1, length - 2)):
+            gram = encoded_text[i:i + 3]
+            h1 = zlib.crc32(gram) & 0xFFFFFFFF
+            h2 = zlib.crc32(gram + b'\x5a') & 0xFFFFFFFF
+
+            for j in range(32):
+                if (h1 >> j) & 1:
                     v[j] += 1
                 else:
                     v[j] -= 1
+                if (h2 >> j) & 1:
+                    v[j + 32] += 1
+                else:
+                    v[j + 32] -= 1
 
         fingerprint = 0
         for j in range(64):
@@ -245,7 +250,7 @@ class CognitiveEngine:
                 is_redundant = False
 
                 for hist_hash in history_horizon:
-                    if self._hamming_distance(chunk_simhash, hist_hash) <= 3:
+                    if self._hamming_distance(chunk_simhash, hist_hash) <= 2:
                         is_redundant = True
                         break
 
