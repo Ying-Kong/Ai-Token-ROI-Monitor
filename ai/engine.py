@@ -15,9 +15,10 @@ class CognitiveEngine:
     3. 拟合计算引擎基于 Transformer 物理特性建模。修改参数仅会扭曲度量结果，无法修改模型实际的认知坍塌规律
 
     """
-    # 唯一对外定义的元数据，用于存证
     ALGO_IDENTITY = "CognitiveROI: Entropy-based Attention Audit"
 
+    _SPACE_DECAY = tuple(0.05 + 0.95 * math.exp(-0.5 * (i + 1)) for i in range(64))
+    _ALNUM_DECAY = tuple(max(0.30, 0.25 + 0.75 * math.exp(-0.5 * (i + 1))) for i in range(64))
 
     def __init__(self, max_context: int = 128000, architecture: str = "hybrid", gamma: float = 0.25):
         self.max_context = max_context
@@ -26,6 +27,7 @@ class CognitiveEngine:
         self.CHUNK_SIZE = 128
         self.T_HEAD_SAFE = 16000
         self.T_TAIL_SAFE = 12000
+        self._token_pattern = re.compile(r'(\s+)|([a-zA-Z0-9]+)|([^\sa-zA-Z0-9]+)')
 
     def _get_dynamic_params(self, t_obs: int) -> dict:
         if t_obs <= min(self.T_HEAD_SAFE, self.T_TAIL_SAFE):
@@ -47,13 +49,13 @@ class CognitiveEngine:
         """拟合注意力遗忘区和有效 Token 计算"""
         if k == 0 or a >= b:
             return coef * (b - a)
-
-        integral_coef = math.sqrt(math.pi) / (2.0 * math.sqrt(k))
+        integral_coef = 0.88622692545 / math.sqrt(k)
+        sqrt_k = math.sqrt(k)
 
         if not is_tail:
-            return coef * integral_coef * (math.erf(b * math.sqrt(k)) - math.erf(a * math.sqrt(k)))
+            return coef * integral_coef * (math.erf(b * sqrt_k) - math.erf(a * sqrt_k))
         else:
-            return coef * integral_coef * (math.erf((1.0 - a) * math.sqrt(k)) - math.erf((1.0 - b) * math.sqrt(k)))
+            return coef * integral_coef * (math.erf((1.0 - a) * sqrt_k) - math.erf((1.0 - b) * sqrt_k))
 
     @staticmethod
     def _find_attention_valley(k1: float, k2: float, beta: float) -> float:
@@ -65,68 +67,63 @@ class CognitiveEngine:
         delta = b_param ** 2 - 4 * a * c
 
         if delta >= 0:
-            roots = [r for r in ((-b_param + math.sqrt(delta)) / (2 * a), (-b_param - math.sqrt(delta)) / (2 * a)) if
+            sqrt_delta = math.sqrt(delta)
+            roots = [r for r in ((-b_param + sqrt_delta) / (2 * a), (-b_param - sqrt_delta) / (2 * a)) if
                      0.0 <= r <= 1.0]
-            if roots:
-                return roots[0]
+            if roots: return roots[0]
         return 0.5
 
-    @staticmethod
-    def _build_token_manifold(full_text: str) -> tuple[list[float], int]:
+    def _scan_token_manifold_streaming(self, full_text: str) -> tuple[list[float], int]:
         """Token 压缩映射，模拟分词器算法"""
         total_chars = len(full_text)
-        if total_chars == 0:
-            return [], 0
+        if total_chars == 0: return [], 0
 
-        cdf = [0.0] * total_chars
-        current_token_acc = 0.0
+        chunk_acc_list = []
+        current_acc = 0.0
+        char_idx = 0
+        next_boundary = self.CHUNK_SIZE - 1
 
-        for match in re.finditer(r'(\s+)|([a-zA-Z0-9]+)|([^\sa-zA-Z0-9]+)', full_text):
+        for match in self._token_pattern.finditer(full_text):
             start, end = match.span()
             spaces, alnums, others = match.groups()
-
             length = end - start
 
             if spaces:
                 for i in range(length):
-                    current_token_acc += 0.05 + 0.95 * math.exp(-0.5 * (i + 1))
-                    cdf[start + i] = current_token_acc
-
+                    current_acc += self._SPACE_DECAY[i] if i < 64 else self._SPACE_DECAY[-1]
+                    if char_idx + i == next_boundary:
+                        chunk_acc_list.append(current_acc)
+                        next_boundary += self.CHUNK_SIZE
             elif alnums:
-                FIXED_ALNUM_WEIGHT = 0.30
-
                 for i in range(length):
-                    weight_val = max(FIXED_ALNUM_WEIGHT, 0.25 + 0.75 * math.exp(-0.5 * (i + 1)))
-
-                    current_token_acc += weight_val
-                    cdf[start + i] = current_token_acc
+                    current_acc += self._ALNUM_DECAY[i] if i < 64 else self._ALNUM_DECAY[-1]
+                    if char_idx + i == next_boundary:
+                        chunk_acc_list.append(current_acc)
+                        next_boundary += self.CHUNK_SIZE
             elif others:
                 encoded_bytes_len = len(others.encode('utf-8'))
                 avg_bytes = encoded_bytes_len / length
+                weight = 1.32 if avg_bytes >= 2.5 else (1.1 if avg_bytes >= 1.5 else 0.55)
 
-                # 依据平均字节数快速断定 CJK 或 特殊符号
-                if avg_bytes >= 2.5:
-                    # 判定为 CJK, UTF-8下汉字通常为 3 bytes
-                    # 1.32为最新LLM的平均 Token, 1字符 ≈ 1.32Token
-                    weight = 1.32
-                elif avg_bytes >= 1.5:
-                    # 针对双字节字符（如拉丁扩展、部分符号、俄语等）
-                    weight = 1.1
-                else:
-                    # 针对单字节特殊符号
-                    weight = 0.55
                 for i in range(length):
-                    current_token_acc += weight
-                    cdf[start + i] = current_token_acc
+                    current_acc += weight
+                    if char_idx + i == next_boundary:
+                        chunk_acc_list.append(current_acc)
+                        next_boundary += self.CHUNK_SIZE
 
-        estimated_total_tokens = int(current_token_acc)
+            char_idx += length
 
-        # 归一化至[0,1]
-        if current_token_acc > 0:
-            inv_acc = 1.0 / current_token_acc
-            cdf = [val * inv_acc for val in cdf]
+        if (char_idx - 1 < next_boundary) and total_chars > 0:
+            chunk_acc_list.append(current_acc)
 
-        return cdf, estimated_total_tokens
+        est_total_tokens = int(current_acc)
+
+        # 归一化至 [0, 1]
+        if current_acc > 0:
+            inv_acc = 1.0 / current_acc
+            chunk_acc_list = [val * inv_acc for val in chunk_acc_list]
+
+        return chunk_acc_list, est_total_tokens
 
     @staticmethod
     def _find_dead_zone(slices: list, theta: float = 0.2) -> dict:
@@ -165,34 +162,27 @@ class CognitiveEngine:
         return {"start_x": 0.0, "end_x": 0.0, "dead_tokens": 0, "wasted_tokens": 0}
 
     @staticmethod
-    def _compute_simhash(text: str) -> int:
+    def _compute_simhash(chunk_bytes: bytes) -> int:
         """轻量级 SimHash 计算：将文本映射为 64-bit 语义指纹"""
-        if not text:
-            return 0
+        clean_bytes = chunk_bytes.translate(None, b' \n\t\r')
+        length = len(clean_bytes)
+        if length < 3: return 0
 
         v = [0] * 64
-        encoded_text = memoryview(text.encode('utf-8'))
-        length = len(encoded_text)
-        # 使用 3-gram 切片提取局部特征
-        for i in range(max(1, length - 2)):
-            gram = encoded_text[i:i + 3]
+        mv = memoryview(clean_bytes)
+
+        for i in range(length - 2):
+            gram = mv[i:i + 3].tobytes()
             h1 = zlib.crc32(gram) & 0xFFFFFFFF
             h2 = zlib.crc32(gram + b'\x5a') & 0xFFFFFFFF
 
             for j in range(32):
-                if (h1 >> j) & 1:
-                    v[j] += 1
-                else:
-                    v[j] -= 1
-                if (h2 >> j) & 1:
-                    v[j + 32] += 1
-                else:
-                    v[j + 32] -= 1
+                v[j] += 1 if (h1 >> j) & 1 else -1
+                v[j + 32] += 1 if (h2 >> j) & 1 else -1
 
         fingerprint = 0
         for j in range(64):
-            if v[j] > 0:
-                fingerprint |= (1 << j)
+            if v[j] > 0: fingerprint |= (1 << j)
         return fingerprint
 
     @staticmethod
@@ -203,7 +193,7 @@ class CognitiveEngine:
         if not full_text:
             return {"t_eff": 0, "bubble_rate": 0.0, "arch_bubble_rate": 0.0, "rn": 0.0, "params": {}}
 
-        cdf, est_total_tokens = self._build_token_manifold(full_text)
+        chunk_acc_list, est_total_tokens = self._scan_token_manifold_streaming(full_text)
         actual_t_obs = t_obs if t_obs > 0 else est_total_tokens
 
         if actual_t_obs <= 0:
@@ -219,18 +209,16 @@ class CognitiveEngine:
         t_eff_arch_total = 0.0
         t_eff_semantic_total = 0.0
         slice_records = []
-        total_chunks = actual_t_obs / self.CHUNK_SIZE
-        horizon_size = max(64, int(total_chunks * 0.2))
+
+        horizon_size = max(64, int((actual_t_obs / self.CHUNK_SIZE) * 0.2))
         history_horizon = deque(maxlen=horizon_size)
         GLOBAL_PENALTY = 0.45
 
-        # 定长步进扫描，维持微积分 δ_x 恒定
-        for i in range(0, total_len, self.CHUNK_SIZE):
-            chunk = full_text[i: i + self.CHUNK_SIZE]
+        a = 0.0
 
-            a = cdf[i - 1] if i > 0 else 0.0
-            end_idx = min(i + self.CHUNK_SIZE - 1, total_len - 1)
-            b = cdf[end_idx]
+        for chunk_idx, i in enumerate(range(0, total_len, self.CHUNK_SIZE)):
+            chunk = full_text[i: i + self.CHUNK_SIZE]
+            b = chunk_acc_list[chunk_idx]
 
             if a >= b:
                 continue
@@ -244,31 +232,23 @@ class CognitiveEngine:
             net_delta_len = max(0, len(compressed_chunk_bytes) - 5)
             density = min(1.0, net_delta_len / orig_bytes_len)
 
-            pure_chars = "".join([c for c in chunk if c.isalnum()])
-            if len(pure_chars) >= 32:
-                chunk_simhash = self._compute_simhash(pure_chars)
+            if orig_bytes_len >= 32:
+                chunk_simhash = self._compute_simhash(chunk_bytes)
                 is_redundant = False
 
                 for hist_hash in history_horizon:
-                    if self._hamming_distance(chunk_simhash, hist_hash) <= 2:
+                    if (chunk_simhash ^ hist_hash).bit_count() <= 2:
                         is_redundant = True
                         break
 
                 if is_redundant:
-                    density *= GLOBAL_PENALTY  # 补充Zlib 32K的范围限制，Hash全局命中重复信息，大幅降低信息密度
-                else:
-                    # 限制大小，防止超长上下文带来的 O(N^2)
+                    density *= GLOBAL_PENALTY
+                elif chunk_simhash != 0:
                     history_horizon.append(chunk_simhash)
 
             # ssm_lambda逻辑判定
-            if ssm_lambda is None:
-                # 根据当前观测长度与最大窗口的比例，自动计算物理坍塌系数
-                ssm_lambda = 3.0 * (actual_t_obs / self.max_context) ** 2
-            else:
-                # 根据特定模型手动指定参数
-                pass
+            current_ssm_lambda = 3.0 * (actual_t_obs / self.max_context) ** 2 if ssm_lambda is None else ssm_lambda
 
-            area = 0.0
             if b <= x_min:
                 area = self._integrate_gaussian(a, b, p["k1"], p["alpha"], is_tail=False)
             elif a >= x_min:
@@ -278,7 +258,7 @@ class CognitiveEngine:
                             self._integrate_gaussian(x_min, b, p["k2"], p["beta"], is_tail=True))
 
             transformer_prob = min(1.0, area / interval_len) if interval_len > 0 else 0.0
-            ssm_prob = math.exp(-ssm_lambda * (1.0 - b))
+            ssm_prob = math.exp(-current_ssm_lambda * (1.0 - b))
 
             # Transformer 均匀覆盖概率叠加
             hybrid_retention_prob = (1.0 - self.gamma) * transformer_prob + self.gamma * ssm_prob
@@ -297,6 +277,8 @@ class CognitiveEngine:
                 "eff_t": slice_eff_semantic
             })
 
+            a=b
+
         t_eff_semantic_total = int(t_eff_semantic_total)
         t_eff_arch_total = round(t_eff_arch_total)
         final_rn = max(0, actual_t_obs - t_eff_semantic_total)
@@ -304,13 +286,13 @@ class CognitiveEngine:
         dead_zone = self._find_dead_zone(slice_records, theta=0.2)
 
         return {
-            "总观测_Token": actual_t_obs, # API JSON返回的全部 Token
+            "总观测_Token": int(actual_t_obs), # API JSON返回的全部 Token
             "最终语义有效_Token": t_eff_semantic_total, # 模型真正理解并思考输出的有意义 Token
             "架构理论留存_Token": t_eff_arch_total, # LLM始终记忆的 Token
             "总认知泡沫量": float(final_rn), # 低信息熵的 Token 总数
-            "全局泡沫率": final_rn / max(1, actual_t_obs), # LLM由于冗余对话，导致的泡沫 Token 在 All_Token 内的占比
-            "纯架构缺陷泡沫率": max(0.0, (actual_t_obs - t_eff_arch_total) / max(1, actual_t_obs)), # LLM的底层架构造成的 Token 损失
-            "动力学推导参数": p,
+            "全局泡沫率": round(final_rn / max(1, actual_t_obs),4), # LLM由于冗余对话，导致的泡沫 Token 在 All_Token 内的占比
+            "纯架构缺陷泡沫率": round(max(0.0, (actual_t_obs - t_eff_arch_total) / max(1, actual_t_obs)), 4), # LLM的底层架构造成的 Token 损失
+            "动力学推导参数": {k: round(v, 6) for k, v in p.items()},
             # 包含α, β, k1, k2
             # α: 头部权重系数
             # β: 尾部增强系数
