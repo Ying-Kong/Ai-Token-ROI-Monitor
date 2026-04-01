@@ -2,16 +2,16 @@ import datetime
 import yaml
 import os
 from openai import OpenAI
-from engine import CognitiveEngine
+from Ai.engine import CognitiveEngine
 
 
 def get_persona() -> dict:
-    with open("../persona.yml", "r", encoding="utf-8") as f:
+    with open("persona.yml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def get_config() -> dict:
-    with open("../api.yml", "r", encoding="utf-8") as f:
+    with open("api.yml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -34,8 +34,8 @@ def deepseek(user_question: str) -> None:
 
     client = OpenAI(api_key=api_key, base_url=base_url)
 
-    target_file = "../test.txt"
-    log_file = "../test.log"
+    target_file = "test.txt"
+    log_file = "test.log"
 
     # 读取长文本背景
     if not os.path.exists(target_file):

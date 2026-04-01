@@ -1,6 +1,6 @@
 import sys
 import logging
-from ai.deepseek_ai import deepseek
+from Ai.deepseek_ai import deepseek
 
 
 logging.basicConfig(
